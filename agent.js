@@ -3,15 +3,15 @@
  * Pulso Research / MVP DATA SRL
  *
  * Comandos Telegram:
- *  /estado  → resumen de cuotas de todas las encuestas activas
- *  /sync    → fuerza sincronización inmediata en pulso-sync
- *  /ayuda   → lista de comandos
+ *  /estado  - resumen de cuotas
+ *  /sync    - fuerza sincronizacion inmediata
+ *  /salud   - estado del sistema (Firebase, sync server, ultimo dato)
+ *  /ayuda   - lista de comandos
  *
- * Acciones automáticas (con confirmación):
- *  - Cuota 50-64 completa en AMBOS géneros → achica adset +30 a 30-49
- *  - Cuota 30-49 completa en AMBOS géneros → pausa adset +30
- *  - Cuota 16-29 completa en UN género    → separa adset en M/F, pausa el completado
- *  - Cuota 16-29 completa en AMBOS géneros → pausa adset 16-29 completo
+ * Automatico:
+ *  - Detecta cuotas al 100% y notifica con botones Confirmar/Cancelar
+ *  - Reporte cada 6 horas
+ *  - Watchdog: alerta si no llegan datos en 90 minutos
  */
 
 'use strict';
@@ -20,15 +20,16 @@ const axios = require('axios');
 const { initializeApp } = require('firebase/app');
 const { getDatabase, ref, onValue } = require('firebase/database');
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // CONFIG
-// ─────────────────────────────────────────
-const TG_TOKEN      = process.env.TG_TOKEN;
-const TG_CHAT_ID    = process.env.TG_CHAT_ID;
-const META_TOKEN    = process.env.META_TOKEN;
-const META_ACCOUNT  = process.env.META_ACCOUNT || '1580131239919455';
-const FB_API_KEY    = process.env.FB_API_KEY;
-const FB_DB_URL     = process.env.FB_DB_URL || 'https://control-cuotas-pulso-default-rtdb.firebaseio.com';
+// -----------------------------------------
+const TG_TOKEN        = process.env.TG_TOKEN;
+const TG_CHAT_ID      = process.env.TG_CHAT_ID;
+const TG_ALLOWED_IDS  = (process.env.TG_ALLOWED_IDS || process.env.TG_CHAT_ID || '').split(',').map(s => s.trim());
+const META_TOKEN      = process.env.META_TOKEN;
+const META_ACCOUNT    = process.env.META_ACCOUNT || '1580131239919455';
+const FB_API_KEY      = process.env.FB_API_KEY;
+const FB_DB_URL       = process.env.FB_DB_URL || 'https://control-cuotas-pulso-default-rtdb.firebaseio.com';
 const SYNC_SERVER_URL = process.env.SYNC_SERVER_URL || 'https://controlcuotasv2-production.up.railway.app';
 
 const AGE_GROUPS_YOUNG = '16-29';
@@ -38,9 +39,11 @@ const SUBRANGES_OLD = [
   { label: '30-49', min: 30, max: 49 },
 ];
 
-// ─────────────────────────────────────────
+const agentStartTime = Date.now();
+
+// -----------------------------------------
 // FIREBASE
-// ─────────────────────────────────────────
+// -----------------------------------------
 let db;
 try {
   const fbApp = initializeApp({ apiKey: FB_API_KEY, databaseURL: FB_DB_URL });
@@ -51,18 +54,19 @@ try {
   process.exit(1);
 }
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // ESTADO INTERNO
-// ─────────────────────────────────────────
+// -----------------------------------------
 let appConfig    = null;
 let lastSyncData = {};
 const pendingActions = new Map();
 const notifiedQuotas = new Set();
 let tgOffset = 0;
+let watchdogAlerted = false;
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // UTILS
-// ─────────────────────────────────────────
+// -----------------------------------------
 function norm(s) {
   return (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
 }
@@ -80,10 +84,21 @@ function getAgeGrp(edad, bounds, groups) {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function pct(c, t) { if (!t) return 0; return Math.round((c / t) * 100); }
+function bar(p) {
+  const f = Math.round(Math.min(p, 100) / 10);
+  return '\u2588'.repeat(f) + '\u2591'.repeat(10 - f);
+}
+function relativeTime(isoStr) {
+  if (!isoStr) return 'nunca';
+  const diff = Math.floor((Date.now() - new Date(isoStr)) / 1000);
+  if (diff < 60) return `hace ${diff}s`;
+  if (diff < 3600) return `hace ${Math.floor(diff / 60)}min`;
+  return `hace ${Math.floor(diff / 3600)}h`;
+}
 
-// ─────────────────────────────────────────
-// ESTRATO LOOKUP  (replica lógica del dashboard)
-// ─────────────────────────────────────────
+// -----------------------------------------
+// ESTRATO LOOKUP (replica logica del dashboard)
+// -----------------------------------------
 const PROV_ALIASES = {
   'caba':'caba','ciudad autonoma de buenos aires':'caba','ciudad de buenos aires':'caba',
   'capital federal':'caba','buenos aires ciudad':'caba',
@@ -103,16 +118,11 @@ function lookupEst(prov, depto, muestra) {
   if (!muestra || !muestra.refTable) return null;
   const pn = normProv(prov);
   const dn = norm(depto);
-
-  // Fixed overrides (ej: CABA=1)
   if (muestra.fixedEstrato) {
     const fo = muestra.fixedEstrato;
     if (fo[pn] !== undefined) return String(fo[pn]);
-    // try original prov name too
-    const pnOrig = norm(prov);
-    if (fo[pnOrig] !== undefined) return String(fo[pnOrig]);
+    if (fo[norm(prov)] !== undefined) return String(fo[norm(prov)]);
   }
-
   let r;
   if (muestra.cobertura === 'provincial' || muestra.cobertura === 'municipal') {
     r = muestra.refTable.find(x => norm(x.nivel2) === dn);
@@ -124,21 +134,10 @@ function lookupEst(prov, depto, muestra) {
   }
   return r ? (r.estrato !== null && r.estrato !== undefined ? String(r.estrato) : null) : null;
 }
-function bar(p) {
-  const f = Math.round(Math.min(p, 100) / 10);
-  return '\u2588'.repeat(f) + '\u2591'.repeat(10 - f);
-}
-function relativeTime(isoStr) {
-  if (!isoStr) return 'nunca';
-  const diff = Math.floor((Date.now() - new Date(isoStr)) / 1000);
-  if (diff < 60) return `hace ${diff}s`;
-  if (diff < 3600) return `hace ${Math.floor(diff / 60)}min`;
-  return `hace ${Math.floor(diff / 3600)}h`;
-}
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // TELEGRAM API
-// ─────────────────────────────────────────
+// -----------------------------------------
 async function tgRequest(method, body = {}) {
   try {
     const res = await axios.post(
@@ -156,6 +155,11 @@ async function tgSend(text, replyMarkup = null) {
   if (replyMarkup) body.reply_markup = replyMarkup;
   return tgRequest('sendMessage', body);
 }
+async function tgSendTo(chatId, text, replyMarkup = null) {
+  const body = { chat_id: chatId, text, parse_mode: 'HTML' };
+  if (replyMarkup) body.reply_markup = replyMarkup;
+  return tgRequest('sendMessage', body);
+}
 async function tgAnswer(id, text = '') {
   return tgRequest('answerCallbackQuery', { callback_query_id: id, text });
 }
@@ -165,9 +169,9 @@ async function tgEdit(messageId, text, replyMarkup = null) {
   return tgRequest('editMessageText', body);
 }
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // COMANDO /estado
-// ─────────────────────────────────────────
+// -----------------------------------------
 function buildEstadoMessage() {
   if (!appConfig) return '\u26a0\ufe0f Sin configuracion cargada aun.';
   const surveys = appConfig.activeSurveys || [];
@@ -182,15 +186,14 @@ function buildEstadoMessage() {
     const rawCases = payload?.rawCases || [];
 
     const totalTarget = Object.values(quotas).reduce((a, b) => a + b, 0);
-    const totalCases  = rawCases.length;
-    const totalPct    = pct(totalCases, totalTarget);
+    const totalPct    = pct(rawCases.length, totalTarget);
 
-    msg += `\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n`;
+    msg += '\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n';
     msg += `\ud83d\udccb <b>${sv.smTitle || sv.smSurveyId}</b>\n`;
-    msg += `${bar(totalPct)} ${totalPct}%  (${totalCases} / ${totalTarget})\n`;
+    msg += `${bar(totalPct)} ${totalPct}%  (${rawCases.length} / ${totalTarget})\n`;
     msg += `\ud83d\udd50 Ultimo sync: ${relativeTime(payload?.lastSync || sv.lastSync)}\n`;
 
-    if (!muestra || !rawCases.length) { msg += `<i>Sin datos de casos aun</i>\n`; continue; }
+    if (!muestra || !rawCases.length) { msg += '<i>Sin datos de casos aun</i>\n'; continue; }
 
     const groups = muestra.ageGroups || [];
     const bounds = parseAgeBounds(groups);
@@ -216,12 +219,62 @@ function buildEstadoMessage() {
   return msg;
 }
 
-// ─────────────────────────────────────────
+// -----------------------------------------
+// COMANDO /salud
+// -----------------------------------------
+async function buildSaludMessage() {
+  const lines = ['\ud83d\udd0d <b>Salud del sistema</b>\n'];
+
+  // Firebase
+  lines.push(db ? '\ud83d\udfe2 Firebase: conectado' : '\ud83d\udd34 Firebase: desconectado');
+
+  // Sync server
+  try {
+    const res = await axios.get(`${SYNC_SERVER_URL}/`, { timeout: 5000 });
+    const d = res.data;
+    const syncStatus = d.syncActive ? 'sync activo' : 'sync detenido';
+    lines.push(`\ud83d\udfe2 Sync server: online (${syncStatus})`);
+    if (d.lastSync) lines.push(`   Ultimo sync server: ${relativeTime(d.lastSync)}`);
+  } catch (e) {
+    lines.push('\ud83d\udd34 Sync server: no responde (' + e.message + ')');
+  }
+
+  // Ultimo dato recibido en Firebase
+  const allSyncs = Object.values(lastSyncData);
+  if (allSyncs.length) {
+    const latest = allSyncs.reduce((a, b) =>
+      new Date(a.lastSync || 0) > new Date(b.lastSync || 0) ? a : b
+    );
+    if (latest.lastSync) {
+      const ageMin = Math.floor((Date.now() - new Date(latest.lastSync)) / 60000);
+      const icon = ageMin < 30 ? '\ud83d\udfe2' : ageMin < 90 ? '\ud83d\udfe1' : '\ud83d\udd34';
+      lines.push(`${icon} Ultimo dato recibido: hace ${ageMin} min`);
+    }
+  } else {
+    lines.push('\ud83d\udfe1 Sin datos recibidos aun');
+  }
+
+  // Uptime
+  const upMs = Date.now() - agentStartTime;
+  const upH  = Math.floor(upMs / 3600000);
+  const upM  = Math.floor((upMs % 3600000) / 60000);
+  lines.push(`\u23f1 Bot activo hace ${upH}h ${upM}min`);
+
+  // Encuestas
+  const nSurveys = (appConfig?.activeSurveys || []).length;
+  lines.push(`\ud83d\udcca Encuestas monitoreadas: ${nSurveys}`);
+
+  // Watchdog
+  lines.push(watchdogAlerted ? '\ud83d\udd34 Watchdog: alerta activa (sync retrasado)' : '\ud83d\udfe2 Watchdog: OK');
+
+  return lines.join('\n');
+}
+
+// -----------------------------------------
 // COMANDO /sync
-// ─────────────────────────────────────────
+// -----------------------------------------
 async function forceSyncNow() {
   try {
-    // Fire and forget — el sync puede tardar >30s con muchas respuestas
     axios.post(`${SYNC_SERVER_URL}/sync/now`, {}, { timeout: 5000 }).catch(() => {});
     return '\u2705 Sync iniciado \u2014 los datos se actualizaran en unos segundos';
   } catch (e) {
@@ -229,9 +282,9 @@ async function forceSyncNow() {
   }
 }
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // META ADS API
-// ─────────────────────────────────────────
+// -----------------------------------------
 async function metaGet(path, params = {}) {
   const res = await axios.get(`https://graph.facebook.com/v19.0${path}`, {
     params: { access_token: META_TOKEN, ...params }, timeout: 15000,
@@ -255,7 +308,11 @@ async function findAdsetsByName(namePart) {
     return (data.data || []).filter(a => norm(a.name).includes(needle));
   } catch (e) { console.error('[meta] findAdsetsByName error:', e.message); return []; }
 }
-function adsetName(estrato, range) { return `Estrato ${estrato} ${range}`; }
+// Convencion: "estrato N jovenes" / "estrato N +30"
+function adsetName(estrato, range) {
+  const rangeLabel = (range === AGE_GROUPS_YOUNG) ? 'jovenes' : '+30';
+  return `estrato ${estrato} ${rangeLabel}`;
+}
 async function pauseAdset(id) { return metaPost(`/${id}`, { status: 'PAUSED' }); }
 async function updateAdsetAge(id, ageMin, ageMax) {
   const targeting = { age_min: ageMin };
@@ -278,9 +335,9 @@ async function cloneAdsetWithGender(original, genderCode, newName) {
   return res.id;
 }
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // LOGICA DE CUOTAS
-// ─────────────────────────────────────────
+// -----------------------------------------
 function getMuestraForSurvey(surveyId) {
   if (!appConfig) return null;
   const sv = (appConfig.activeSurveys || []).find(s => String(s.smSurveyId) === String(surveyId));
@@ -294,8 +351,7 @@ function computeCounts(rawCases, muestra) {
   const bounds = parseAgeBounds(groups);
   const counts = {};
   for (const c of rawCases) {
-    const ageGrp = getAgeGrp(parseInt(c.edad), bounds, groups);
-    // Estrato: usar el del caso si ya viene resuelto, sino buscarlo en refTable
+    const ageGrp  = getAgeGrp(parseInt(c.edad), bounds, groups);
     const estrato = (c.estrato && c.estrato !== '?')
       ? String(c.estrato)
       : (lookupEst(c.prov, c.depto, muestra) || '?');
@@ -305,14 +361,14 @@ function computeCounts(rawCases, muestra) {
   return counts;
 }
 function evaluateActions(surveyId, rawCases, survey, muestra) {
-  const quotas = survey.quotas || {};
-  const counts = computeCounts(rawCases, muestra);
-  const actions = [];
+  const quotas    = survey.quotas || {};
+  const counts    = computeCounts(rawCases, muestra);
+  const actions   = [];
   const ageGroups = muestra.ageGroups || [];
-  const estratos = [...new Set(Object.keys(quotas).map(k => k.split('||')[2]))];
+  const estratos  = [...new Set(Object.keys(quotas).map(k => k.split('||')[2]))];
 
   for (const estrato of estratos) {
-    // Adset 16-29
+    // Adset jovenes (16-29 / 18-29)
     const youngGroup = ageGroups.find(g => { const n = norm(g); return n.startsWith('16') || n.startsWith('18'); });
     if (youngGroup) {
       const keyF = `Femenino||${youngGroup}||${estrato}`;
@@ -321,8 +377,8 @@ function evaluateActions(surveyId, rawCases, survey, muestra) {
       const cF = counts[keyF]||0, cM = counts[keyM]||0;
       const doneF = tF > 0 && cF >= tF, doneM = tM > 0 && cM >= tM;
       const kBoth = `${surveyId}||${estrato}||${youngGroup}||both`;
-      const kF = `${surveyId}||${estrato}||${youngGroup}||F`;
-      const kM = `${surveyId}||${estrato}||${youngGroup}||M`;
+      const kF    = `${surveyId}||${estrato}||${youngGroup}||F`;
+      const kM    = `${surveyId}||${estrato}||${youngGroup}||M`;
 
       if (doneF && doneM && !notifiedQuotas.has(kBoth)) {
         actions.push({ notifKey: kBoth, type: 'pause', adsetNamePart: adsetName(estrato, AGE_GROUPS_YOUNG),
@@ -347,7 +403,7 @@ function evaluateActions(surveyId, rawCases, survey, muestra) {
       const cF = counts[keyF]||0, cM = counts[keyM]||0;
       const kBoth = `${surveyId}||${estrato}||${matchedGroup}||both`;
       if ((tF > 0 && cF >= tF) && (tM > 0 && cM >= tM) && !notifiedQuotas.has(kBoth)) {
-        const idx = SUBRANGES_OLD.indexOf(subrange);
+        const idx  = SUBRANGES_OLD.indexOf(subrange);
         const next = SUBRANGES_OLD[idx + 1];
         if (!next) {
           actions.push({ notifKey: kBoth, type: 'pause', adsetNamePart: adsetName(estrato, AGE_GROUPS_OLD),
@@ -363,9 +419,9 @@ function evaluateActions(surveyId, rawCases, survey, muestra) {
   return actions;
 }
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // EJECUTAR ACCION EN META
-// ─────────────────────────────────────────
+// -----------------------------------------
 async function executeAction(action) {
   const adsets = await findAdsetsByName(action.adsetNamePart);
   if (!adsets.length) throw new Error(`No se encontro adset con nombre que contenga "${action.adsetNamePart}"`);
@@ -378,14 +434,14 @@ async function executeAction(action) {
       await updateAdsetAge(adset.id, action.ageMin, action.ageMax);
       return `Adset <b>${adset.name}</b> acotado a ${action.ageMin}-${action.ageMax} anos \u2713`;
     case 'split_pause_female': {
-      const nameM = `${adset.name} - Masculino`, nameF = `${adset.name} - Femenino`;
+      const nameM = `${adset.name} masculino`, nameF = `${adset.name} femenino`;
       const newFId = await cloneAdsetWithGender(adset, 2, nameF);
       await cloneAdsetWithGender(adset, 1, nameM);
       await pauseAdset(newFId); await pauseAdset(adset.id);
       return `Dividido:\n\u2022 <b>${nameM}</b> activo\n\u2022 <b>${nameF}</b> pausado\n\u2022 Original pausado`;
     }
     case 'split_pause_male': {
-      const nameM = `${adset.name} - Masculino`, nameF = `${adset.name} - Femenino`;
+      const nameM = `${adset.name} masculino`, nameF = `${adset.name} femenino`;
       const newMId = await cloneAdsetWithGender(adset, 1, nameM);
       await cloneAdsetWithGender(adset, 2, nameF);
       await pauseAdset(newMId); await pauseAdset(adset.id);
@@ -395,9 +451,9 @@ async function executeAction(action) {
   }
 }
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // NOTIFICAR
-// ─────────────────────────────────────────
+// -----------------------------------------
 async function notifyAndAwaitConfirmation(action) {
   const cbConfirm = `confirm_${Date.now()}`;
   const cbCancel  = `cancel_${Date.now()}`;
@@ -411,32 +467,29 @@ async function notifyAndAwaitConfirmation(action) {
       { text: '\u274c Cancelar',  callback_data: cbCancel  },
     ]]}
   );
-  console.log(`[agent] Notificacion enviada: ${action.notifKey}`);
+  console.log(`[agent] Notificacion: ${action.notifKey}`);
 }
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // PROCESAR UPDATES TELEGRAM
-// ─────────────────────────────────────────
+// -----------------------------------------
 async function processTelegramUpdate(update) {
   // Callback (botones)
   if (update.callback_query) {
     const cq = update.callback_query;
     await tgAnswer(cq.id);
-    const data = cq.data;
-    const messageId = cq.message?.message_id;
+    const data = cq.data, messageId = cq.message?.message_id;
     if (!pendingActions.has(data)) { await tgEdit(messageId, '\u26a0\ufe0f Esta accion ya fue procesada o expiro.'); return; }
     const action = pendingActions.get(data);
-    const other = data.startsWith('confirm_') ? data.replace('confirm_','cancel_') : data.replace('cancel_','confirm_');
+    const other  = data.startsWith('confirm_') ? data.replace('confirm_','cancel_') : data.replace('cancel_','confirm_');
     pendingActions.delete(data); pendingActions.delete(other);
     if (action.cancel) { await tgEdit(messageId, `\u274c Cancelado.\n\n${action.description}`); return; }
     await tgEdit(messageId, `\u23f3 Ejecutando...\n\n${action.description}`);
     try {
       const result = await executeAction(action);
       await tgEdit(messageId, `\u2705 <b>Ejecutado</b>\n\n${action.description}\n\n<i>${result}</i>`);
-      console.log(`[agent] Ejecutado: ${action.notifKey}`);
     } catch (e) {
       await tgEdit(messageId, `\u274c <b>Error</b>\n\n${action.description}\n\n<i>${e.message}</i>`);
-      console.error(`[agent] Error:`, e.message);
     }
     return;
   }
@@ -444,29 +497,34 @@ async function processTelegramUpdate(update) {
   // Mensaje de texto (comandos)
   const msg = update.message;
   if (!msg?.text) return;
-  if (String(msg.chat.id) !== String(TG_CHAT_ID)) return;
+  const chatId = String(msg.chat.id);
+  if (!TG_ALLOWED_IDS.includes(chatId)) return; // solo usuarios autorizados
   const text = msg.text.trim().toLowerCase();
 
   if (text.startsWith('/estado') || text.startsWith('/status')) {
-    await tgSend('\u23f3 Calculando...');
-    await tgSend(buildEstadoMessage());
+    await tgSendTo(chatId, '\u23f3 Calculando...');
+    await tgSendTo(chatId, buildEstadoMessage());
+  } else if (text.startsWith('/salud') || text.startsWith('/health')) {
+    await tgSendTo(chatId, '\u23f3 Verificando...');
+    await tgSendTo(chatId, await buildSaludMessage());
   } else if (text.startsWith('/sync')) {
-    await tgSend('\u23f3 Forzando sincronizacion...');
-    await tgSend(await forceSyncNow());
+    await tgSendTo(chatId, '\u23f3 Forzando sincronizacion...');
+    await tgSendTo(chatId, await forceSyncNow());
   } else if (text.startsWith('/ayuda') || text.startsWith('/help') || text.startsWith('/start')) {
-    await tgSend(
+    await tgSendTo(chatId,
       '\ud83e\udd16 <b>Pulso Agent \u2014 Comandos</b>\n\n' +
       '/estado \u2014 Resumen de cuotas de todas las encuestas activas\n' +
       '/sync \u2014 Fuerza sincronizacion inmediata con SurveyMonkey\n' +
+      '/salud \u2014 Estado del sistema (Firebase, sync server, ultimo dato)\n' +
       '/ayuda \u2014 Muestra esta ayuda\n\n' +
       'Te aviso automaticamente cuando una cuota se completa y necesita accion en Meta Ads.'
     );
   }
 }
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // TELEGRAM LONG POLLING
-// ─────────────────────────────────────────
+// -----------------------------------------
 async function pollTelegram() {
   while (true) {
     try {
@@ -487,15 +545,15 @@ async function pollTelegram() {
   }
 }
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // FIREBASE LISTENERS
-// ─────────────────────────────────────────
+// -----------------------------------------
 function startFirebaseListeners() {
   onValue(ref(db, 'pulso/v4config'), (snap) => {
     try {
       const raw = snap.val(); if (!raw) return;
       appConfig = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      console.log(`[firebase] Config — ${(appConfig.activeSurveys||[]).length} encuesta(s)`);
+      console.log(`[firebase] Config \u2014 ${(appConfig.activeSurveys||[]).length} encuesta(s)`);
     } catch (e) { console.error('[firebase] v4config error:', e.message); }
   });
 
@@ -504,9 +562,14 @@ function startFirebaseListeners() {
       const root = snap.val(); if (!root || !appConfig) return;
       const entries = typeof root === 'string' ? { legacy: JSON.parse(root) } : root;
       for (const [sid, raw] of Object.entries(entries)) {
-        const payload = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        const surveyId = payload.surveyId || sid;
+        const payload   = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        const surveyId  = payload.surveyId || sid;
         lastSyncData[String(surveyId)] = payload;
+        // Resetear watchdog cuando llegan datos nuevos
+        if (watchdogAlerted) {
+          watchdogAlerted = false;
+          await tgSend('\ud83d\udfe2 <b>Sync recuperado</b> \u2014 Datos actualizados correctamente.');
+        }
         const info = getMuestraForSurvey(surveyId);
         if (!info?.muestra) continue;
         const actions = evaluateActions(surveyId, payload.rawCases || [], info.survey, info.muestra);
@@ -516,33 +579,69 @@ function startFirebaseListeners() {
   });
 }
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // HEALTH CHECK HTTP
-// ─────────────────────────────────────────
+// -----------------------------------------
 const http = require('http');
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ status: 'ok', agent: 'pulso-agent',
-    pending: pendingActions.size / 2, surveys: Object.keys(lastSyncData).length, config: !!appConfig }));
+    pending: pendingActions.size / 2, surveys: Object.keys(lastSyncData).length,
+    watchdogAlerted, config: !!appConfig }));
 }).listen(process.env.PORT || 3001, () => console.log(`[http] Puerto ${process.env.PORT || 3001}`));
 
-// ─────────────────────────────────────────
+// -----------------------------------------
 // INICIO
-// ─────────────────────────────────────────
+// -----------------------------------------
 (async () => {
   console.log('\n  Pulso Agent arrancando...');
   console.log(`  Telegram:    ${TG_TOKEN ? '\u2713' : '\u2717 FALTA TG_TOKEN'}`);
   console.log(`  Meta:        ${META_TOKEN ? '\u2713' : '\u2717 FALTA META_TOKEN'}`);
   console.log(`  Firebase:    \u2713`);
   console.log(`  Cuenta Meta: act_${META_ACCOUNT}`);
-  console.log(`  Sync server: ${SYNC_SERVER_URL}\n`);
+  console.log(`  Sync server: ${SYNC_SERVER_URL}`);
+  console.log(`  Usuarios:    ${TG_ALLOWED_IDS.join(', ')}\n`);
 
   if (TG_TOKEN && TG_CHAT_ID) {
     await tgSend(
       '\ud83d\udfe2 <b>Pulso Agent iniciado</b>\nMonitoreando cuotas en tiempo real.\n\n' +
-      'Comandos:\n/estado \u2014 ver cuotas\n/sync \u2014 forzar sync\n/ayuda \u2014 mas info'
+      'Comandos:\n/estado \u2014 ver cuotas\n/sync \u2014 forzar sync\n/salud \u2014 estado del sistema\n/ayuda \u2014 mas info'
     );
   }
+
   startFirebaseListeners();
   pollTelegram();
+
+  // Reporte automatico cada 6 horas
+  setInterval(async () => {
+    try {
+      await tgSend('\u23f0 <b>Reporte automatico</b>\n\n' + buildEstadoMessage());
+      console.log('[agent] Reporte automatico enviado');
+    } catch (e) { console.error('[agent] Error reporte:', e.message); }
+  }, 6 * 60 * 60 * 1000);
+
+  // Watchdog: alerta si no llegan datos en 90 minutos
+  setInterval(async () => {
+    try {
+      const allSyncs = Object.values(lastSyncData);
+      if (!allSyncs.length) return;
+      const latest = allSyncs.reduce((a, b) =>
+        new Date(a.lastSync||0) > new Date(b.lastSync||0) ? a : b
+      );
+      if (!latest.lastSync) return;
+      const ageMin = Math.floor((Date.now() - new Date(latest.lastSync)) / 60000);
+      if (ageMin > 90 && !watchdogAlerted) {
+        watchdogAlerted = true;
+        await tgSend(
+          '\u26a0\ufe0f <b>Pulso Agent \u2014 Sin datos nuevos</b>\n\n' +
+          `Hace <b>${ageMin} minutos</b> que no llegan datos de SurveyMonkey.\n` +
+          'El sync puede estar caido o pausado.\n\n' +
+          'Usa /sync para forzar una actualizacion o /salud para diagnosticar.'
+        );
+        console.log(`[watchdog] Alerta: sin datos hace ${ageMin}min`);
+      }
+    } catch (e) { console.error('[watchdog]', e.message); }
+  }, 15 * 60 * 1000);
+
+  console.log('[agent] Reporte cada 6hs + watchdog cada 15min activados');
 })();
