@@ -80,6 +80,50 @@ function getAgeGrp(edad, bounds, groups) {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function pct(c, t) { if (!t) return 0; return Math.round((c / t) * 100); }
+
+// ─────────────────────────────────────────
+// ESTRATO LOOKUP  (replica lógica del dashboard)
+// ─────────────────────────────────────────
+const PROV_ALIASES = {
+  'caba':'caba','ciudad autonoma de buenos aires':'caba','ciudad de buenos aires':'caba',
+  'capital federal':'caba','buenos aires ciudad':'caba',
+  'buenos aires':'buenos aires','provincia de buenos aires':'buenos aires',
+  'santiago del estero':'stgo del estero','stgo del estero':'stgo del estero',
+  'tierra del fuego':'tierra del fuego',
+  'tierra del fuego, antartida e islas del atlantico sur':'tierra del fuego',
+  'entre rios':'entre rios','entre r\u00edos':'entre rios',
+  'neuqu\u00e9n':'neuquen','neuquen':'neuquen',
+  'c\u00f3rdoba':'cordoba','cordoba':'cordoba',
+  'tucum\u00e1n':'tucuman','tucuman':'tucuman',
+  'r\u00edo negro':'rio negro','rio negro':'rio negro',
+};
+function normProv(s) { const n = norm(s); return PROV_ALIASES[n] || n; }
+
+function lookupEst(prov, depto, muestra) {
+  if (!muestra || !muestra.refTable) return null;
+  const pn = normProv(prov);
+  const dn = norm(depto);
+
+  // Fixed overrides (ej: CABA=1)
+  if (muestra.fixedEstrato) {
+    const fo = muestra.fixedEstrato;
+    if (fo[pn] !== undefined) return String(fo[pn]);
+    // try original prov name too
+    const pnOrig = norm(prov);
+    if (fo[pnOrig] !== undefined) return String(fo[pnOrig]);
+  }
+
+  let r;
+  if (muestra.cobertura === 'provincial' || muestra.cobertura === 'municipal') {
+    r = muestra.refTable.find(x => norm(x.nivel2) === dn);
+    if (!r) r = muestra.refTable.find(x => norm(x.nivel2).includes(dn) || dn.includes(norm(x.nivel2)));
+  } else {
+    r = muestra.refTable.find(x => normProv(x.nivel1) === pn && norm(x.nivel2) === dn);
+    if (!r) r = muestra.refTable.find(x => normProv(x.nivel1) === pn &&
+      (norm(x.nivel2).includes(dn) || dn.includes(norm(x.nivel2))));
+  }
+  return r ? (r.estrato !== null && r.estrato !== undefined ? String(r.estrato) : null) : null;
+}
 function bar(p) {
   const f = Math.round(Math.min(p, 100) / 10);
   return '\u2588'.repeat(f) + '\u2591'.repeat(10 - f);
@@ -177,11 +221,11 @@ function buildEstadoMessage() {
 // ─────────────────────────────────────────
 async function forceSyncNow() {
   try {
-    // Fire and forget — no esperar respuesta completa
+    // Fire and forget — el sync puede tardar >30s con muchas respuestas
     axios.post(`${SYNC_SERVER_URL}/sync/now`, {}, { timeout: 5000 }).catch(() => {});
-    return '✅ Sync iniciado — los datos se actualizarán en unos segundos';
+    return '\u2705 Sync iniciado \u2014 los datos se actualizaran en unos segundos';
   } catch (e) {
-    return `❌ Error: ${e.message}`;
+    return `\u274c Error: ${e.message}`;
   }
 }
 
@@ -251,7 +295,11 @@ function computeCounts(rawCases, muestra) {
   const counts = {};
   for (const c of rawCases) {
     const ageGrp = getAgeGrp(parseInt(c.edad), bounds, groups);
-    const key = `${c.gen}||${ageGrp}||${c.estrato}`;
+    // Estrato: usar el del caso si ya viene resuelto, sino buscarlo en refTable
+    const estrato = (c.estrato && c.estrato !== '?')
+      ? String(c.estrato)
+      : (lookupEst(c.prov, c.depto, muestra) || '?');
+    const key = `${c.gen}||${ageGrp}||${estrato}`;
     counts[key] = (counts[key] || 0) + 1;
   }
   return counts;
