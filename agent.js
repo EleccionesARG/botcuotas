@@ -177,11 +177,11 @@ function buildEstadoMessage() {
 // ─────────────────────────────────────────
 async function forceSyncNow() {
   try {
-    const res = await axios.post(`${SYNC_SERVER_URL}/sync/now`, {}, { timeout: 30000 });
-    if (res.data?.ok) return `\u2705 Sync ejecutado \u2014 ultimo: ${relativeTime(res.data.lastSync)}`;
-    return `\u26a0\ufe0f Respuesta: ${JSON.stringify(res.data)}`;
+    // Fire and forget — no esperar respuesta completa
+    axios.post(`${SYNC_SERVER_URL}/sync/now`, {}, { timeout: 5000 }).catch(() => {});
+    return '✅ Sync iniciado — los datos se actualizarán en unos segundos';
   } catch (e) {
-    return `\u274c Error al contactar sync server: ${e.message}`;
+    return `❌ Error: ${e.message}`;
   }
 }
 
