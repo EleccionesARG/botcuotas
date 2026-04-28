@@ -25,8 +25,7 @@
 'use strict';
 
 const axios = require('axios');
-const { initializeApp }                          = require('firebase/app');
-const { getDatabase, ref, onValue, get, set }    = require('firebase/database');
+const admin = require('firebase-admin');
 
 // -----------------------------------------
 // CONFIG
@@ -39,7 +38,6 @@ const META_TOKEN        = process.env.META_TOKEN;
 const META_ACCOUNT      = process.env.META_ACCOUNT || '1580131239919455';
 // FIX: nueva variable — si 'true', ejecuta acciones Meta automaticamente sin pedir confirmacion
 const META_AUTO_CONFIRM = process.env.META_AUTO_CONFIRM === 'true';
-const FB_API_KEY        = process.env.FB_API_KEY;
 const FB_DB_URL         = process.env.FB_DB_URL || 'https://control-cuotas-pulso-default-rtdb.firebaseio.com';
 const SYNC_SERVER_URL   = process.env.SYNC_SERVER_URL || 'https://controlcuotasv2-production.up.railway.app';
 
@@ -57,11 +55,15 @@ const agentStartTime = Date.now();
 // -----------------------------------------
 let db;
 try {
-  const fbApp = initializeApp({ apiKey: FB_API_KEY, databaseURL: FB_DB_URL });
-  db = getDatabase(fbApp);
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: FB_DB_URL,
+  });
+  db = admin.database();
   console.log('[firebase] Conectado a', FB_DB_URL);
 } catch (e) {
-  console.error('[firebase] Error:', e.message);
+  console.error('[firebase] Error (verificar FIREBASE_SERVICE_ACCOUNT):', e.message);
   process.exit(1);
 }
 
@@ -170,7 +172,7 @@ function lookupEst(prov, depto, muestra) {
 // -----------------------------------------
 async function loadAgentState() {
   try {
-    const snap = await get(ref(db, 'pulso/agentState'));
+    const snap = await db.ref('pulso/agentState').once('value');
     const val  = snap.val();
     if (!val) {
       console.log('[state] Sin estado previo en Firebase (primer arranque limpio)');
@@ -196,7 +198,7 @@ async function loadAgentState() {
 async function saveNotifiedQuota(key) {
   notifiedQuotas.add(key);
   try {
-    await set(ref(db, `pulso/agentState/notifiedQuotas/${sanitizeFBKey(key)}`), true);
+    await db.ref(`pulso/agentState/notifiedQuotas/${sanitizeFBKey(key)}`).set(true);
   } catch (e) {
     console.warn('[state] Error persistiendo cuota notificada:', e.message);
   }
@@ -205,7 +207,7 @@ async function saveNotifiedQuota(key) {
 async function saveCompletedSurvey(surveyId) {
   completedSurveys.add(String(surveyId));
   try {
-    await set(ref(db, `pulso/agentState/completedSurveys/${surveyId}`), new Date().toISOString());
+    await db.ref(`pulso/agentState/completedSurveys/${surveyId}`).set(new Date().toISOString());
   } catch (e) {
     console.warn('[state] Error persistiendo encuesta completada:', e.message);
   }
@@ -749,7 +751,31 @@ async function processTelegramUpdate(update) {
 // -----------------------------------------
 // TELEGRAM LONG POLLING
 // -----------------------------------------
+// Descarta updates pendientes y resuelve conflicto 409 al arrancar
+// Ocurre cuando Railway corre vieja + nueva instancia en paralelo durante el deploy
+async function initTelegramPolling() {
+  // Reintentar hasta que el 409 desaparezca (la instancia vieja se termina)
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const res = await tgRequest('getUpdates', { offset: -1, timeout: 0 });
+    if (res === null) {
+      // 409 u otro error — esperar y reintentar
+      console.log(`[telegram] Esperando que la instancia anterior cierre... (intento ${attempt + 1})`);
+      await sleep(5000);
+      continue;
+    }
+    // Descartar todos los updates pendientes avanzando el offset
+    if (res.result?.length) {
+      tgOffset = res.result[res.result.length - 1].update_id + 1;
+      console.log(`[telegram] ${res.result.length} update(s) descartado(s), offset=${tgOffset}`);
+    }
+    return true; // listo para empezar
+  }
+  console.warn('[telegram] No se pudo resolver conflicto 409 tras 100s, iniciando igual');
+  return false;
+}
+
 async function pollTelegram() {
+  await initTelegramPolling();
   while (true) {
     try {
       const res = await tgRequest('getUpdates', {
@@ -773,7 +799,7 @@ async function pollTelegram() {
 // FIREBASE LISTENERS
 // -----------------------------------------
 function startFirebaseListeners() {
-  onValue(ref(db, 'pulso/v4config'), (snap) => {
+  db.ref('pulso/v4config').on('value', (snap) => {
     try {
       const raw = snap.val(); if (!raw) return;
       appConfig = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -781,7 +807,7 @@ function startFirebaseListeners() {
     } catch (e) { console.error('[firebase] v4config error:', e.message); }
   });
 
-  onValue(ref(db, 'pulso/v4sync'), async (snap) => {
+  db.ref('pulso/v4sync').on('value', async (snap) => {
     try {
       const root = snap.val();
       if (!root || !appConfig) return;
