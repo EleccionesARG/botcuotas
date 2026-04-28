@@ -12,11 +12,13 @@
  *  7. cloneAdsetWithGender copia bid_strategy y promoted_object
  *  8. pendingActions con expiracion (2h) → no acumula entradas infinitas
  *  9. Auth check en callbacks de Telegram
- * 10. Reporte y watchdog skippean encuestas completadas
+ * 10. Reporte y watchdog omiten encuestas completadas y sync caido
+ * 11. Watchdog solo resetea si llegan datos frescos (< 30 min)
+ * 12. Fix Telegram 409: espera a que instancia anterior cierre antes de empezar polling
  *
  * Comandos Telegram:
  *  /estado        - resumen de cuotas activas
- *  /estado todo   - incluye encuestas completadas
+ *  /estado todo   - incluye encuestas ya completadas
  *  /sync          - fuerza sincronizacion inmediata
  *  /salud         - estado del sistema
  *  /ayuda         - lista de comandos
@@ -25,7 +27,8 @@
 'use strict';
 
 const axios = require('axios');
-const admin = require('firebase-admin');
+const { initializeApp }                       = require('firebase/app');
+const { getDatabase, ref, onValue, get, set } = require('firebase/database');
 
 // -----------------------------------------
 // CONFIG
@@ -36,8 +39,8 @@ const TG_ALLOWED_IDS    = (process.env.TG_ALLOWED_IDS || process.env.TG_CHAT_ID 
                             .split(',').map(s => s.trim()).filter(Boolean);
 const META_TOKEN        = process.env.META_TOKEN;
 const META_ACCOUNT      = process.env.META_ACCOUNT || '1580131239919455';
-// FIX: nueva variable — si 'true', ejecuta acciones Meta automaticamente sin pedir confirmacion
 const META_AUTO_CONFIRM = process.env.META_AUTO_CONFIRM === 'true';
+const FB_API_KEY        = process.env.FB_API_KEY;
 const FB_DB_URL         = process.env.FB_DB_URL || 'https://control-cuotas-pulso-default-rtdb.firebaseio.com';
 const SYNC_SERVER_URL   = process.env.SYNC_SERVER_URL || 'https://controlcuotasv2-production.up.railway.app';
 
@@ -55,15 +58,11 @@ const agentStartTime = Date.now();
 // -----------------------------------------
 let db;
 try {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    databaseURL: FB_DB_URL,
-  });
-  db = admin.database();
+  const fbApp = initializeApp({ apiKey: FB_API_KEY, databaseURL: FB_DB_URL });
+  db = getDatabase(fbApp);
   console.log('[firebase] Conectado a', FB_DB_URL);
 } catch (e) {
-  console.error('[firebase] Error (verificar FIREBASE_SERVICE_ACCOUNT):', e.message);
+  console.error('[firebase] Error:', e.message);
   process.exit(1);
 }
 
@@ -73,17 +72,15 @@ try {
 let appConfig    = null;
 let lastSyncData = {};
 
-const pendingActions = new Map();  // cbKey → action
-const pendingExpiry  = new Map();  // cbKey → timestamp de expiracion (ms)
+const pendingActions = new Map();
+const pendingExpiry  = new Map();
 
-// FIX: estas dos Sets se persisten en Firebase → sobreviven reinicios de Railway
-const notifiedQuotas   = new Set(); // pulso/agentState/notifiedQuotas
-const completedSurveys = new Set(); // pulso/agentState/completedSurveys
+const notifiedQuotas   = new Set();
+const completedSurveys = new Set();
 
 let tgOffset        = 0;
 let watchdogAlerted = false;
 
-// FIX: cola de acciones para evitar race conditions entre listeners paralelos
 const actionQueue    = [];
 let actionProcessing = false;
 
@@ -118,9 +115,6 @@ function relativeTime(isoStr) {
   if (diff < 3600) return `hace ${Math.floor(diff / 60)}min`;
   return `hace ${Math.floor(diff / 3600)}h`;
 }
-
-// Sanitiza una clave para usarla como nodo de Firebase
-// Firebase no permite: . # $ / [ ] en claves
 function sanitizeFBKey(k) {
   return k.replace(/\|/g, '_PIPE_').replace(/[.#$/\[\]]/g, '_');
 }
@@ -129,7 +123,7 @@ function unsanitizeFBKey(k) {
 }
 
 // -----------------------------------------
-// ESTRATO LOOKUP (replica logica del dashboard)
+// ESTRATO LOOKUP
 // -----------------------------------------
 const PROV_ALIASES = {
   'caba': 'caba', 'ciudad autonoma de buenos aires': 'caba', 'ciudad de buenos aires': 'caba',
@@ -168,11 +162,11 @@ function lookupEst(prov, depto, muestra) {
 }
 
 // -----------------------------------------
-// PERSISTENCIA EN FIREBASE (FIX #1)
+// PERSISTENCIA EN FIREBASE
 // -----------------------------------------
 async function loadAgentState() {
   try {
-    const snap = await db.ref('pulso/agentState').once('value');
+    const snap = await get(ref(db, 'pulso/agentState'));
     const val  = snap.val();
     if (!val) {
       console.log('[state] Sin estado previo en Firebase (primer arranque limpio)');
@@ -198,7 +192,7 @@ async function loadAgentState() {
 async function saveNotifiedQuota(key) {
   notifiedQuotas.add(key);
   try {
-    await db.ref(`pulso/agentState/notifiedQuotas/${sanitizeFBKey(key)}`).set(true);
+    await set(ref(db, `pulso/agentState/notifiedQuotas/${sanitizeFBKey(key)}`), true);
   } catch (e) {
     console.warn('[state] Error persistiendo cuota notificada:', e.message);
   }
@@ -207,14 +201,14 @@ async function saveNotifiedQuota(key) {
 async function saveCompletedSurvey(surveyId) {
   completedSurveys.add(String(surveyId));
   try {
-    await db.ref(`pulso/agentState/completedSurveys/${surveyId}`).set(new Date().toISOString());
+    await set(ref(db, `pulso/agentState/completedSurveys/${surveyId}`), new Date().toISOString());
   } catch (e) {
     console.warn('[state] Error persistiendo encuesta completada:', e.message);
   }
 }
 
 // -----------------------------------------
-// COLA DE ACCIONES — FIX #3 (race condition)
+// COLA DE ACCIONES
 // -----------------------------------------
 async function processActionQueue() {
   if (actionProcessing) return;
@@ -222,7 +216,6 @@ async function processActionQueue() {
   try {
     while (actionQueue.length > 0) {
       const action = actionQueue.shift();
-      // Re-chequear: puede haberse notificado mientras esperaba en la cola
       if (notifiedQuotas.has(action.notifKey)) continue;
       await notifyOrExecute(action);
       await sleep(600);
@@ -243,7 +236,6 @@ function enqueueActions(actions) {
   if (added > 0) processActionQueue().catch(e => console.error('[queue]', e.message));
 }
 
-// Limpia pendingActions expiradas (FIX #8)
 function cleanExpiredPendingActions() {
   const now = Date.now();
   let cleaned = 0;
@@ -292,7 +284,7 @@ async function tgEdit(messageId, text, replyMarkup = null) {
 }
 
 // -----------------------------------------
-// COMANDO /estado — FIX #2 (encuestas completadas)
+// COMANDO /estado
 // -----------------------------------------
 function buildEstadoMessage(includeCompleted = false) {
   if (!appConfig) return '\u26a0\ufe0f Sin configuracion cargada aun.';
@@ -325,8 +317,8 @@ function buildEstadoMessage(includeCompleted = false) {
     if (isDone) { msg += '<i>Todas las cuotas completadas.</i>\n'; continue; }
     if (!muestra || !rawCases.length) { msg += '<i>Sin datos de casos aun</i>\n'; continue; }
 
-    const groups  = muestra.ageGroups || [];
-    const counts  = computeCounts(rawCases, muestra);
+    const groups   = muestra.ageGroups || [];
+    const counts   = computeCounts(rawCases, muestra);
     const estratos = [...new Set(Object.keys(quotas).map(k => k.split('||')[2]))].filter(Boolean).sort();
 
     for (const estrato of estratos) {
@@ -398,12 +390,12 @@ async function buildSaludMessage() {
 }
 
 // -----------------------------------------
-// COMANDO /sync — FIX #5 (await real)
+// COMANDO /sync
 // -----------------------------------------
 async function forceSyncNow() {
   try {
     const res = await axios.post(`${SYNC_SERVER_URL}/sync/now`, {}, { timeout: 10000 });
-    return `\u2705 ${res.data?.message || 'Sync iniciado — datos disponibles en unos segundos'}`;
+    return `\u2705 ${res.data?.message || 'Sync iniciado \u2014 datos disponibles en unos segundos'}`;
   } catch (e) {
     if (e.response?.data?.error) return `\u274c ${e.response.data.error}`;
     return `\u274c Sync server no responde: ${e.message}`;
@@ -441,7 +433,6 @@ function adsetName(estrato, range) {
 }
 async function pauseAdset(id) { return metaPost(`/${id}`, { status: 'PAUSED' }); }
 
-// FIX #6: primero obtiene targeting actual y lo mergea, no lo sobreescribe
 async function updateAdsetAge(id, ageMin, ageMax) {
   const adset = await metaGet(`/${id}`, { fields: 'targeting' });
   const targeting = typeof adset.targeting === 'string'
@@ -453,7 +444,6 @@ async function updateAdsetAge(id, ageMin, ageMax) {
   return metaPost(`/${id}`, { targeting: JSON.stringify(targeting) });
 }
 
-// FIX #7: copia bid_strategy y promoted_object ademas de bid_amount
 async function cloneAdsetWithGender(original, genderCode, newName) {
   const orig = await metaGet(`/${original.id}`, {
     fields: 'name,campaign_id,daily_budget,targeting,optimization_goal,billing_event,bid_amount,bid_strategy,promoted_object',
@@ -503,8 +493,6 @@ function computeCounts(rawCases, muestra) {
   }
   return counts;
 }
-
-// FIX #2: detecta si TODAS las cuotas (> 0) estan completas
 function isSurveyComplete(rawCases, survey, muestra) {
   const quotas  = survey.quotas || {};
   const nonZero = Object.entries(quotas).filter(([, t]) => t > 0);
@@ -521,7 +509,6 @@ function evaluateActions(surveyId, rawCases, survey, muestra) {
   const estratos  = [...new Set(Object.keys(quotas).map(k => k.split('||')[2]))];
 
   for (const estrato of estratos) {
-    // --- Adset jovenes (16-29 / 18-29) ---
     const youngGroup = ageGroups.find(g => {
       const n = norm(g); return n.startsWith('16') || n.startsWith('18');
     });
@@ -537,27 +524,17 @@ function evaluateActions(surveyId, rawCases, survey, muestra) {
       const kM    = `${surveyId}||${estrato}||${youngGroup}||M`;
 
       if (doneF && doneM && !notifiedQuotas.has(kBoth)) {
-        actions.push({
-          notifKey: kBoth, type: 'pause',
-          adsetNamePart: adsetName(estrato, AGE_GROUPS_YOUNG),
-          description: `\u2705 Cuota <b>${youngGroup} - Estrato ${estrato}</b> completa en ambos g\u00e9neros (\u2642${cM}/${tM} \u2640${cF}/${tF})\n\n\u2192 Pausar adset <b>${adsetName(estrato, AGE_GROUPS_YOUNG)}</b>`,
-        });
+        actions.push({ notifKey: kBoth, type: 'pause', adsetNamePart: adsetName(estrato, AGE_GROUPS_YOUNG),
+          description: `\u2705 Cuota <b>${youngGroup} - Estrato ${estrato}</b> completa en ambos g\u00e9neros (\u2642${cM}/${tM} \u2640${cF}/${tF})\n\n\u2192 Pausar adset <b>${adsetName(estrato, AGE_GROUPS_YOUNG)}</b>` });
       } else if (doneF && !doneM && !notifiedQuotas.has(kF)) {
-        actions.push({
-          notifKey: kF, type: 'split_pause_female',
-          adsetNamePart: adsetName(estrato, AGE_GROUPS_YOUNG),
-          description: `\u26a0\ufe0f Cuota <b>${youngGroup} - Estrato ${estrato} - Femenino</b> completa (\u2640${cF}/${tF})\nMasculino a\u00fan abierto (\u2642${cM}/${tM})\n\n\u2192 Separar adset en M/F y pausar Femenino`,
-        });
+        actions.push({ notifKey: kF, type: 'split_pause_female', adsetNamePart: adsetName(estrato, AGE_GROUPS_YOUNG),
+          description: `\u26a0\ufe0f Cuota <b>${youngGroup} - Estrato ${estrato} - Femenino</b> completa (\u2640${cF}/${tF})\nMasculino a\u00fan abierto (\u2642${cM}/${tM})\n\n\u2192 Separar adset en M/F y pausar Femenino` });
       } else if (doneM && !doneF && !notifiedQuotas.has(kM)) {
-        actions.push({
-          notifKey: kM, type: 'split_pause_male',
-          adsetNamePart: adsetName(estrato, AGE_GROUPS_YOUNG),
-          description: `\u26a0\ufe0f Cuota <b>${youngGroup} - Estrato ${estrato} - Masculino</b> completa (\u2642${cM}/${tM})\nFemenino a\u00fan abierto (\u2640${cF}/${tF})\n\n\u2192 Separar adset en M/F y pausar Masculino`,
-        });
+        actions.push({ notifKey: kM, type: 'split_pause_male', adsetNamePart: adsetName(estrato, AGE_GROUPS_YOUNG),
+          description: `\u26a0\ufe0f Cuota <b>${youngGroup} - Estrato ${estrato} - Masculino</b> completa (\u2642${cM}/${tM})\nFemenino a\u00fan abierto (\u2640${cF}/${tF})\n\n\u2192 Separar adset en M/F y pausar Masculino` });
       }
     }
 
-    // --- Adset +30 subrangos ---
     for (const subrange of SUBRANGES_OLD) {
       const matchedGroup = ageGroups.find(g => {
         const b = parseAgeBounds([g])[0];
@@ -574,18 +551,12 @@ function evaluateActions(surveyId, rawCases, survey, muestra) {
         const idx  = SUBRANGES_OLD.indexOf(subrange);
         const next = SUBRANGES_OLD[idx + 1];
         if (!next) {
-          actions.push({
-            notifKey: kBoth, type: 'pause',
-            adsetNamePart: adsetName(estrato, AGE_GROUPS_OLD),
-            description: `\u2705 Cuota <b>${matchedGroup} - Estrato ${estrato}</b> completa en ambos g\u00e9neros. Todos los rangos +30 completos.\n\n\u2192 Pausar adset <b>${adsetName(estrato, AGE_GROUPS_OLD)}</b>`,
-          });
+          actions.push({ notifKey: kBoth, type: 'pause', adsetNamePart: adsetName(estrato, AGE_GROUPS_OLD),
+            description: `\u2705 Cuota <b>${matchedGroup} - Estrato ${estrato}</b> completa en ambos g\u00e9neros. Todos los rangos +30 completos.\n\n\u2192 Pausar adset <b>${adsetName(estrato, AGE_GROUPS_OLD)}</b>` });
         } else {
-          actions.push({
-            notifKey: kBoth, type: 'update_age',
-            adsetNamePart: adsetName(estrato, AGE_GROUPS_OLD),
+          actions.push({ notifKey: kBoth, type: 'update_age', adsetNamePart: adsetName(estrato, AGE_GROUPS_OLD),
             ageMin: next.min, ageMax: next.max,
-            description: `\u2705 Cuota <b>${matchedGroup} - Estrato ${estrato}</b> completa en ambos g\u00e9neros (\u2642${cM}/${tM} \u2640${cF}/${tF})\n\n\u2192 Acotar adset <b>${adsetName(estrato, AGE_GROUPS_OLD)}</b> a <b>${next.min}-${next.max} a\u00f1os</b>`,
-          });
+            description: `\u2705 Cuota <b>${matchedGroup} - Estrato ${estrato}</b> completa en ambos g\u00e9neros (\u2642${cM}/${tM} \u2640${cF}/${tF})\n\n\u2192 Acotar adset <b>${adsetName(estrato, AGE_GROUPS_OLD)}</b> a <b>${next.min}-${next.max} a\u00f1os</b>` });
         }
       }
     }
@@ -629,14 +600,12 @@ async function executeAction(action) {
 }
 
 // -----------------------------------------
-// NOTIFICAR O EJECUTAR — FIX #4 (META_AUTO_CONFIRM)
+// NOTIFICAR O EJECUTAR
 // -----------------------------------------
 async function notifyOrExecute(action) {
-  // Persistir ANTES de actuar para que incluso si falla la notif, no se re-intente en el proximo ciclo
   await saveNotifiedQuota(action.notifKey);
 
   if (META_AUTO_CONFIRM) {
-    // Modo automatico: ejecutar directamente
     const sent = await tgSend(
       `\u26a1 <b>Pulso \u2014 Ejecutando autom\u00e1ticamente</b>\n\n${action.description}\n\n\u23f3 En proceso...`
     );
@@ -645,21 +614,18 @@ async function notifyOrExecute(action) {
       const text = `\u2705 <b>Ejecutado</b>\n\n${action.description}\n\n<i>${result}</i>`;
       if (sent?.result?.message_id) await tgEdit(sent.result.message_id, text);
       else await tgSend(text);
-      console.log(`[agent] Auto-ejecutado: ${action.notifKey}`);
     } catch (e) {
       const text = `\u274c <b>Error al ejecutar</b>\n\n${action.description}\n\n<i>${e.message}</i>`;
       if (sent?.result?.message_id) await tgEdit(sent.result.message_id, text);
       else await tgSend(text);
-      console.error(`[agent] Error auto-ejecutando ${action.notifKey}:`, e.message);
     }
   } else {
-    // Modo confirmacion: enviar botones
     const ts = Date.now();
     const cbConfirm = `confirm_${ts}`;
     const cbCancel  = `cancel_${ts}`;
     pendingActions.set(cbConfirm, action);
     pendingActions.set(cbCancel, { ...action, cancel: true });
-    const expiry = ts + 2 * 60 * 60 * 1000; // expira en 2 horas
+    const expiry = ts + 2 * 60 * 60 * 1000;
     pendingExpiry.set(cbConfirm, expiry);
     pendingExpiry.set(cbCancel, expiry);
 
@@ -678,13 +644,11 @@ async function notifyOrExecute(action) {
 // PROCESAR UPDATES TELEGRAM
 // -----------------------------------------
 async function processTelegramUpdate(update) {
-  // Callback (botones)
   if (update.callback_query) {
     const cq     = update.callback_query;
     const fromId = String(cq.from?.id || '');
     await tgAnswer(cq.id);
 
-    // FIX #9: auth check en callbacks (evita que alguien externo ejecute acciones)
     if (!TG_ALLOWED_IDS.includes(fromId)) {
       console.warn(`[telegram] Callback rechazado — usuario no autorizado: ${fromId}`);
       return;
@@ -696,8 +660,7 @@ async function processTelegramUpdate(update) {
       return;
     }
     const action = pendingActions.get(data);
-    // Eliminar ambas opciones (confirm y cancel)
-    const other = data.startsWith('confirm_')
+    const other  = data.startsWith('confirm_')
       ? data.replace('confirm_', 'cancel_')
       : data.replace('cancel_', 'confirm_');
     pendingActions.delete(data); pendingActions.delete(other);
@@ -717,7 +680,6 @@ async function processTelegramUpdate(update) {
     return;
   }
 
-  // Mensaje de texto (comandos)
   const msg = update.message;
   if (!msg?.text) return;
   const chatId = String(msg.chat.id);
@@ -749,29 +711,23 @@ async function processTelegramUpdate(update) {
 }
 
 // -----------------------------------------
-// TELEGRAM LONG POLLING
+// TELEGRAM LONG POLLING — fix 409
 // -----------------------------------------
-// Descarta updates pendientes y resuelve conflicto 409 al arrancar
-// Ocurre cuando Railway corre vieja + nueva instancia en paralelo durante el deploy
 async function initTelegramPolling() {
-  // Reintentar hasta que el 409 desaparezca (la instancia vieja se termina)
   for (let attempt = 0; attempt < 20; attempt++) {
     const res = await tgRequest('getUpdates', { offset: -1, timeout: 0 });
     if (res === null) {
-      // 409 u otro error — esperar y reintentar
       console.log(`[telegram] Esperando que la instancia anterior cierre... (intento ${attempt + 1})`);
       await sleep(5000);
       continue;
     }
-    // Descartar todos los updates pendientes avanzando el offset
     if (res.result?.length) {
       tgOffset = res.result[res.result.length - 1].update_id + 1;
       console.log(`[telegram] ${res.result.length} update(s) descartado(s), offset=${tgOffset}`);
     }
-    return true; // listo para empezar
+    return;
   }
   console.warn('[telegram] No se pudo resolver conflicto 409 tras 100s, iniciando igual');
-  return false;
 }
 
 async function pollTelegram() {
@@ -799,7 +755,7 @@ async function pollTelegram() {
 // FIREBASE LISTENERS
 // -----------------------------------------
 function startFirebaseListeners() {
-  db.ref('pulso/v4config').on('value', (snap) => {
+  onValue(ref(db, 'pulso/v4config'), (snap) => {
     try {
       const raw = snap.val(); if (!raw) return;
       appConfig = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -807,13 +763,12 @@ function startFirebaseListeners() {
     } catch (e) { console.error('[firebase] v4config error:', e.message); }
   });
 
-  db.ref('pulso/v4sync').on('value', async (snap) => {
+  onValue(ref(db, 'pulso/v4sync'), async (snap) => {
     try {
       const root = snap.val();
       if (!root || !appConfig) return;
       const entries = typeof root === 'string' ? { legacy: JSON.parse(root) } : root;
 
-      // FIX #3: recolectar todas las acciones y encolarlas juntas (no disparar en paralelo)
       const newActions = [];
 
       for (const [sid, raw] of Object.entries(entries)) {
@@ -821,8 +776,7 @@ function startFirebaseListeners() {
         const surveyId = String(payload.surveyId || sid);
         lastSyncData[surveyId] = payload;
 
-        // Resetear watchdog SOLO si los datos son realmente frescos (< 30 min)
-        // Evita que datos viejos/huerfanos de Firebase liberen el watchdog en loop
+        // Resetear watchdog SOLO si los datos son frescos (< 30 min)
         const dataAgeMin = payload.lastSync
           ? Math.floor((Date.now() - new Date(payload.lastSync)) / 60000)
           : 999;
@@ -831,7 +785,6 @@ function startFirebaseListeners() {
           await tgSend('\ud83d\udfe2 <b>Sync recuperado</b> \u2014 Datos actualizados correctamente.');
         }
 
-        // FIX #2: ignorar encuestas ya completadas
         if (completedSurveys.has(surveyId)) continue;
 
         const info = getMuestraForSurvey(surveyId);
@@ -839,7 +792,6 @@ function startFirebaseListeners() {
 
         const rawCases = payload.rawCases || [];
 
-        // FIX #2: chequear si la encuesta se acaba de completar
         if (isSurveyComplete(rawCases, info.survey, info.muestra)) {
           await saveCompletedSurvey(surveyId);
           await tgSend(
@@ -891,8 +843,6 @@ http.createServer((req, res) => {
   console.log(`  Usuarios TG:  ${TG_ALLOWED_IDS.join(', ')}`);
   console.log(`  Auto-confirm: ${META_AUTO_CONFIRM ? 'SI (meta ejecuta automatico)' : 'NO (pide confirmacion)'}\n`);
 
-  // FIX #1: cargar estado previo ANTES de activar listeners
-  // Esto evita que al reiniciar Railway se re-notifiquen todas las cuotas ya procesadas
   await loadAgentState();
 
   if (TG_TOKEN && TG_CHAT_ID) {
@@ -908,20 +858,19 @@ http.createServer((req, res) => {
   }
 
   startFirebaseListeners();
-  pollTelegram(); // no await — corre en background
+  pollTelegram();
 
-  // Reporte automatico cada 6 horas (FIX #10: solo encuestas activas)
+  // Reporte automatico cada 6 horas — omitir si sync caido o sin encuestas activas
   setInterval(async () => {
     try {
       const activeSurveys = (appConfig?.activeSurveys || [])
         .filter(sv => !completedSurveys.has(String(sv.smSurveyId)));
       if (!activeSurveys.length) {
-        console.log('[agent] Reporte omitido — sin encuestas activas');
+        console.log('[agent] Reporte omitido \u2014 sin encuestas activas');
         return;
       }
-      // No reportar si el watchdog está activo (sync caído, datos viejos)
       if (watchdogAlerted) {
-        console.log('[agent] Reporte omitido — sync caído (watchdog activo)');
+        console.log('[agent] Reporte omitido \u2014 sync caido (watchdog activo)');
         return;
       }
       await tgSend('\u23f0 <b>Reporte autom\u00e1tico</b>\n\n' + buildEstadoMessage());
@@ -929,7 +878,7 @@ http.createServer((req, res) => {
     } catch (e) { console.error('[agent] Error reporte:', e.message); }
   }, 6 * 60 * 60 * 1000);
 
-  // Watchdog: alerta si no llegan datos en 90 min (FIX #10: solo encuestas activas)
+  // Watchdog: alerta si no llegan datos en 90 min
   setInterval(async () => {
     try {
       const activeSurveyIds = (appConfig?.activeSurveys || [])
@@ -960,7 +909,7 @@ http.createServer((req, res) => {
     } catch (e) { console.error('[watchdog]', e.message); }
   }, 15 * 60 * 1000);
 
-  // Limpiar pendingActions expiradas cada hora (FIX #8)
+  // Limpiar pendingActions expiradas cada hora
   setInterval(cleanExpiredPendingActions, 60 * 60 * 1000);
 
   console.log('[agent] Iniciado: reporte 6hs | watchdog 15min | limpieza pendientes 1h');
