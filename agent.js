@@ -795,8 +795,12 @@ function startFirebaseListeners() {
         const surveyId = String(payload.surveyId || sid);
         lastSyncData[surveyId] = payload;
 
-        // Resetear watchdog cuando llegan datos frescos
-        if (watchdogAlerted) {
+        // Resetear watchdog SOLO si los datos son realmente frescos (< 30 min)
+        // Evita que datos viejos/huerfanos de Firebase liberen el watchdog en loop
+        const dataAgeMin = payload.lastSync
+          ? Math.floor((Date.now() - new Date(payload.lastSync)) / 60000)
+          : 999;
+        if (watchdogAlerted && dataAgeMin < 30) {
           watchdogAlerted = false;
           await tgSend('\ud83d\udfe2 <b>Sync recuperado</b> \u2014 Datos actualizados correctamente.');
         }
@@ -885,7 +889,15 @@ http.createServer((req, res) => {
     try {
       const activeSurveys = (appConfig?.activeSurveys || [])
         .filter(sv => !completedSurveys.has(String(sv.smSurveyId)));
-      if (!activeSurveys.length) return; // no reportar si todo está completo o no hay config
+      if (!activeSurveys.length) {
+        console.log('[agent] Reporte omitido — sin encuestas activas');
+        return;
+      }
+      // No reportar si el watchdog está activo (sync caído, datos viejos)
+      if (watchdogAlerted) {
+        console.log('[agent] Reporte omitido — sync caído (watchdog activo)');
+        return;
+      }
       await tgSend('\u23f0 <b>Reporte autom\u00e1tico</b>\n\n' + buildEstadoMessage());
       console.log('[agent] Reporte autom\u00e1tico enviado');
     } catch (e) { console.error('[agent] Error reporte:', e.message); }
